@@ -24,7 +24,7 @@ use tracing::{Level, debug, enabled, trace, warn};
 use trusted_publishing::TrustedPublishingToken;
 use url::Url;
 
-use uv_auth::Credentials;
+use uv_auth::{Credentials, Realm, PyxTokenStore};
 use uv_cache::{Cache, Refresh};
 use uv_client::{
     BaseClient, MetadataFormat, OwnedArchive, RegistryClientBuilder, RequestBuilder,
@@ -396,12 +396,49 @@ pub async fn upload(
         .await
         .map_err(|err| PublishError::PublishPrepare(file.to_path_buf(), Box::new(err)))?;
 
+    // If the registry in on the same realm as the token store, perform a validation request.
+    if PyxTokenStore::from_settings()
+        .as_ref()
+        .map(PyxTokenStore::api)
+        .is_ok_and(|api| Realm::from(&**api) == Realm::from(&**registry))
+    {
+        debug!("Performing validation request for {registry}");
+
+        let mut validation_url = registry.clone();
+        validation_url
+            .path_segments_mut()
+            .expect("URL must have path segments")
+            .push("validate");
+
+        let request = build_validation_request(
+            raw_filename,
+            &validation_url,
+            client,
+            credentials,
+            &form_metadata,
+        );
+
+        let response = request.send().await.map_err(|err| {
+            PublishError::PublishSend(
+                file.to_path_buf(),
+                validation_url.clone(),
+                PublishSendError::ReqwestMiddleware(err),
+            )
+        })?;
+
+        handle_response(&validation_url, response)
+            .await
+            .map_err(|err| {
+                PublishError::PublishSend(file.to_path_buf(), validation_url.clone(), err)
+            })?;
+    }
+
     let mut n_past_retries = 0;
     let start_time = SystemTime::now();
-    // N.B. We cannot use the client policy here because it is set to zero retries
+    // N.B. We cannot use the client policy here because it is set to zero retries.
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(retries_from_env()?);
     loop {
-        let (request, idx) = build_request(
+        let (request, idx) = build_upload_request(
             file,
             raw_filename,
             filename,
@@ -770,8 +807,8 @@ impl<'a> IntoIterator for &'a FormMetadata {
 
 /// Build the upload request.
 ///
-/// Returns the request and the reporter progress bar id.
-async fn build_request<'a>(
+/// Returns the [`RequestBuilder`] and the reporter progress bar ID.
+async fn build_upload_request<'a>(
     file: &Path,
     raw_filename: &str,
     filename: &DistFilename,
@@ -838,6 +875,63 @@ async fn build_request<'a>(
     }
 
     Ok((request, idx))
+}
+
+/// Build the validation request, to validate the upload without actually uploading the file.
+///
+/// Returns the [`RequestBuilder`].
+fn build_validation_request<'a>(
+    raw_filename: &str,
+    registry: &DisplaySafeUrl,
+    client: &'a BaseClient,
+    credentials: &Credentials,
+    form_metadata: &FormMetadata,
+) -> RequestBuilder<'a> {
+    let mut form = reqwest::multipart::Form::new();
+    for (key, value) in form_metadata.iter() {
+        form = form.text(*key, value.clone());
+    }
+    form = form.text("filename", raw_filename.to_owned());
+
+    // If we have a username but no password, attach the username to the URL so the authentication
+    // middleware can find the matching password.
+    let url = if let Some(username) = credentials
+        .username()
+        .filter(|_| credentials.password().is_none())
+    {
+        let mut url = registry.clone();
+        let _ = url.set_username(username);
+        url
+    } else {
+        registry.clone()
+    };
+
+    let mut request = client
+        .for_host(&url)
+        .post(Url::from(url))
+        .multipart(form)
+        // Ask PyPI for a structured error messages instead of HTML-markup error messages.
+        // For other registries, we ask them to return plain text over HTML. See
+        // [`PublishSendError::extract_remote_error`].
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json;q=0.9, text/plain;q=0.8, text/html;q=0.7",
+        );
+
+    match credentials {
+        Credentials::Basic { password, .. } => {
+            if password.is_some() {
+                debug!("Using HTTP Basic authentication");
+                request = request.header(AUTHORIZATION, credentials.to_header_value());
+            }
+        }
+        Credentials::Bearer { .. } => {
+            debug!("Using Bearer token authentication");
+            request = request.header(AUTHORIZATION, credentials.to_header_value());
+        }
+    }
+
+    request
 }
 
 /// Log response information and map response to an error variant if not successful.
@@ -919,7 +1013,7 @@ mod tests {
     use uv_distribution_filename::DistFilename;
     use uv_redacted::DisplaySafeUrl;
 
-    use crate::{FormMetadata, Reporter, build_request};
+    use crate::{FormMetadata, Reporter, build_upload_request};
 
     struct DummyReporter;
 
@@ -998,7 +1092,7 @@ mod tests {
         "###);
 
         let client = BaseClientBuilder::default().build();
-        let (request, _) = build_request(
+        let (request, _) = build_upload_request(
             &file,
             raw_filename,
             &filename,
@@ -1150,7 +1244,7 @@ mod tests {
         "###);
 
         let client = BaseClientBuilder::default().build();
-        let (request, _) = build_request(
+        let (request, _) = build_upload_request(
             &file,
             raw_filename,
             &filename,
