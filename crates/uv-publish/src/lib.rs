@@ -24,7 +24,7 @@ use tracing::{Level, debug, enabled, trace, warn};
 use trusted_publishing::TrustedPublishingToken;
 use url::Url;
 
-use uv_auth::{Credentials, Realm, PyxTokenStore};
+use uv_auth::{Credentials, PyxTokenStore, Realm};
 use uv_cache::{Cache, Refresh};
 use uv_client::{
     BaseClient, MetadataFormat, OwnedArchive, RegistryClientBuilder, RequestBuilder,
@@ -60,6 +60,8 @@ pub enum PublishError {
     PublishPrepare(PathBuf, #[source] Box<PublishPrepareError>),
     #[error("Failed to publish `{}` to {}", _0.user_display(), _1)]
     PublishSend(PathBuf, DisplaySafeUrl, #[source] PublishSendError),
+    #[error("Unable to publish `{}` to {}", _0.user_display(), _1)]
+    Validate(PathBuf, DisplaySafeUrl, #[source] PublishSendError),
     #[error("Failed to obtain token for trusted publishing")]
     TrustedPublishing(#[from] TrustedPublishingError),
     #[error("{0} are not allowed when using trusted publishing")]
@@ -383,6 +385,7 @@ pub async fn check_trusted_publishing(
 /// Implements a custom retry flow since the request isn't cloneable.
 pub async fn upload(
     file: &Path,
+    form_metadata: &FormMetadata,
     raw_filename: &str,
     filename: &DistFilename,
     registry: &DisplaySafeUrl,
@@ -392,10 +395,6 @@ pub async fn upload(
     download_concurrency: &Semaphore,
     reporter: Arc<impl Reporter>,
 ) -> Result<bool, PublishError> {
-    let form_metadata = FormMetadata::read_from_file(file, filename)
-        .await
-        .map_err(|err| PublishError::PublishPrepare(file.to_path_buf(), Box::new(err)))?;
-
     // If the registry in on the same realm as the token store, perform a validation request.
     if PyxTokenStore::from_settings()
         .as_ref()
@@ -415,7 +414,7 @@ pub async fn upload(
             &validation_url,
             client,
             credentials,
-            &form_metadata,
+            form_metadata,
         );
 
         let response = request.send().await.map_err(|err| {
@@ -445,7 +444,7 @@ pub async fn upload(
             registry,
             client,
             credentials,
-            &form_metadata,
+            form_metadata,
             reporter.clone(),
         )
         .await
@@ -502,6 +501,51 @@ pub async fn upload(
             }
         };
     }
+}
+
+/// Validate a file against a registry.
+pub async fn validate(
+    file: &Path,
+    form_metadata: &FormMetadata,
+    raw_filename: &str,
+    registry: &DisplaySafeUrl,
+    client: &BaseClient,
+    credentials: &Credentials,
+) -> Result<(), PublishError> {
+    if PyxTokenStore::from_settings()
+        .as_ref()
+        .is_ok_and(|store| store.is_known_url(registry))
+    {
+        debug!("Performing validation request for {registry}");
+
+        let mut validation_url = registry.clone();
+        validation_url
+            .path_segments_mut()
+            .expect("URL must have path segments")
+            .push("validate");
+
+        let request = build_validation_request(
+            raw_filename,
+            &validation_url,
+            client,
+            credentials,
+            form_metadata,
+        );
+
+        let response = request.send().await.map_err(|err| {
+            PublishError::Validate(
+                file.to_path_buf(),
+                registry.clone(),
+                PublishSendError::ReqwestMiddleware(err),
+            )
+        })?;
+
+        handle_response(&validation_url, response)
+            .await
+            .map_err(|err| PublishError::Validate(file.to_path_buf(), registry.clone(), err))?;
+    }
+
+    Ok(())
 }
 
 /// Check whether we should skip the upload of a file because it already exists on the index.
@@ -684,13 +728,13 @@ async fn metadata(file: &Path, filename: &DistFilename) -> Result<Metadata23, Pu
 }
 
 #[derive(Debug, Clone)]
-struct FormMetadata(Vec<(&'static str, String)>);
+pub struct FormMetadata(Vec<(&'static str, String)>);
 
 impl FormMetadata {
     /// Collect the non-file fields for the multipart request from the package METADATA.
     ///
     /// Reference implementation: <https://github.com/pypi/warehouse/blob/d2c36d992cf9168e0518201d998b2707a3ef1e72/warehouse/forklift/legacy.py#L1376-L1430>
-    async fn read_from_file(
+    pub async fn read_from_file(
         file: &Path,
         filename: &DistFilename,
     ) -> Result<Self, PublishPrepareError> {
