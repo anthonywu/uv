@@ -29,7 +29,7 @@ use uv_normalize::PackageName;
 use uv_pep440::Version;
 use uv_pep508::MarkerEnvironment;
 use uv_platform_tags::Platform;
-use uv_pypi_types::{PypiSimpleDetail, ResolutionMetadata};
+use uv_pypi_types::{PypiSimpleDetail, PyxSimpleDetail, ResolutionMetadata};
 use uv_redacted::DisplaySafeUrl;
 use uv_small_str::SmallString;
 use uv_torch::TorchStrategy;
@@ -585,17 +585,48 @@ impl RegistryClient {
                 })?;
 
                 let unarchived = match media_type {
-                    MediaType::Json => {
+                    MediaType::PyxV1Msgpack => {
                         let bytes = response
                             .bytes()
                             .await
                             .map_err(|err| ErrorKind::from_reqwest(url.clone(), err))?;
+                        let data: PyxSimpleDetail = rmp_serde::from_slice(bytes.as_ref())
+                            .map_err(|err| Error::from_msgpack_err(err, url.clone()))?;
+
+                        SimpleMetadata::from_pyx_files(
+                            data.files,
+                            data.core_metadata,
+                            package_name,
+                            &url,
+                        )
+                    }
+                    MediaType::PyxV1Json => {
+                        let bytes = response
+                            .bytes()
+                            .await
+                            .map_err(|err| ErrorKind::from_reqwest(url.clone(), err))?;
+                        let data: PyxSimpleDetail = serde_json::from_slice(bytes.as_ref())
+                            .map_err(|err| Error::from_json_err(err, url.clone()))?;
+
+                        SimpleMetadata::from_pyx_files(
+                            data.files,
+                            data.core_metadata,
+                            package_name,
+                            &url,
+                        )
+                    }
+                    MediaType::PypiV1Json => {
+                        let bytes = response
+                            .bytes()
+                            .await
+                            .map_err(|err| ErrorKind::from_reqwest(url.clone(), err))?;
+
                         let data: PypiSimpleDetail = serde_json::from_slice(bytes.as_ref())
                             .map_err(|err| Error::from_json_err(err, url.clone()))?;
 
                         SimpleMetadata::from_pypi_files(data.files, package_name, &url)
                     }
-                    MediaType::Html => {
+                    MediaType::PypiV1Html | MediaType::TextHtml => {
                         let text = response
                             .text()
                             .await
@@ -1089,6 +1120,7 @@ pub struct SimpleMetadata(Vec<SimpleMetadatum>);
 pub struct SimpleMetadatum {
     pub version: Version,
     pub files: VersionFiles,
+    pub metadata: Option<ResolutionMetadata>,
 }
 
 impl SimpleMetadata {
@@ -1101,7 +1133,7 @@ impl SimpleMetadata {
         package_name: &PackageName,
         base: &Url,
     ) -> Self {
-        let mut map: BTreeMap<Version, VersionFiles> = BTreeMap::default();
+        let mut version_map: BTreeMap<Version, VersionFiles> = BTreeMap::default();
 
         // Convert to a reference-counted string.
         let base = SmallString::from(base.as_str());
@@ -1117,7 +1149,7 @@ impl SimpleMetadata {
                 DistFilename::SourceDistFilename(ref inner) => &inner.version,
                 DistFilename::WheelFilename(ref inner) => &inner.version,
             };
-            let file = match File::try_from(file, &base) {
+            let file = match File::try_from_pypi(file, &base) {
                 Ok(file) => file,
                 Err(err) => {
                     // Ignore files with unparsable version specifiers.
@@ -1125,7 +1157,7 @@ impl SimpleMetadata {
                     continue;
                 }
             };
-            match map.entry(version.clone()) {
+            match version_map.entry(version.clone()) {
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     entry.get_mut().push(filename, file);
                 }
@@ -1136,9 +1168,82 @@ impl SimpleMetadata {
                 }
             }
         }
+
         Self(
-            map.into_iter()
-                .map(|(version, files)| SimpleMetadatum { version, files })
+            version_map
+                .into_iter()
+                .map(|(version, files)| SimpleMetadatum {
+                    version,
+                    files,
+                    metadata: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn from_pyx_files(
+        files: Vec<uv_pypi_types::PyxFile>,
+        mut core_metadata: FxHashMap<Version, uv_pypi_types::CoreMetadatum>,
+        package_name: &PackageName,
+        base: &Url,
+    ) -> Self {
+        let mut version_map: BTreeMap<Version, VersionFiles> = BTreeMap::default();
+
+        // Convert to a reference-counted string.
+        let base = SmallString::from(base.as_str());
+
+        // Group the distributions by version and kind
+        for file in files {
+            let file = match File::try_from_pyx(file, &base) {
+                Ok(file) => file,
+                Err(err) => {
+                    // Ignore files with unparsable version specifiers.
+                    warn!("Skipping file for {package_name}: {err}");
+                    continue;
+                }
+            };
+            let Some(filename) = DistFilename::try_from_filename(&file.filename, package_name)
+            else {
+                warn!("Skipping file for {package_name}: {}", file.filename);
+                continue;
+            };
+            let version = match filename {
+                DistFilename::SourceDistFilename(ref inner) => &inner.version,
+                DistFilename::WheelFilename(ref inner) => &inner.version,
+            };
+            match version_map.entry(version.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(filename, file);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let mut files = VersionFiles::default();
+                    files.push(filename, file);
+                    entry.insert(files);
+                }
+            }
+        }
+
+        Self(
+            version_map
+                .into_iter()
+                .map(|(version, files)| {
+                    let metadata =
+                        core_metadata
+                            .remove(&version)
+                            .map(|metadata| ResolutionMetadata {
+                                name: package_name.clone(),
+                                version: version.clone(),
+                                requires_dist: metadata.requires_dist,
+                                requires_python: metadata.requires_python,
+                                provides_extras: metadata.provides_extras,
+                                dynamic: false,
+                            });
+                    SimpleMetadatum {
+                        version,
+                        files,
+                        metadata,
+                    }
+                })
                 .collect(),
         )
     }
@@ -1177,16 +1282,22 @@ impl ArchivedSimpleMetadata {
 
 #[derive(Debug)]
 enum MediaType {
-    Json,
-    Html,
+    PyxV1Msgpack,
+    PyxV1Json,
+    PypiV1Json,
+    PypiV1Html,
+    TextHtml,
 }
 
 impl MediaType {
     /// Parse a media type from a string, returning `None` if the media type is not supported.
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "application/vnd.pypi.simple.v1+json" => Some(Self::Json),
-            "application/vnd.pypi.simple.v1+html" | "text/html" => Some(Self::Html),
+            "application/vnd.pyx.simple.v1+msgpack" => Some(Self::PyxV1Msgpack),
+            "application/vnd.pyx.simple.v1+json" => Some(Self::PyxV1Json),
+            "application/vnd.pypi.simple.v1+json" => Some(Self::PypiV1Json),
+            "application/vnd.pypi.simple.v1+html" => Some(Self::PypiV1Html),
+            "text/html" => Some(Self::TextHtml),
             _ => None,
         }
     }
@@ -1195,7 +1306,19 @@ impl MediaType {
     #[inline]
     const fn accepts() -> &'static str {
         // See: https://peps.python.org/pep-0691/#version-format-selection
-        "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.01"
+        "application/vnd.pyx.simple.v1+msgpack, application/vnd.pyx.simple.v1+json;q=0.9, application/vnd.pypi.simple.v1+json;q=0.8, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.01"
+    }
+}
+
+impl std::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PyxV1Msgpack => write!(f, "application/vnd.pyx.simple.v1+msgpack"),
+            Self::PyxV1Json => write!(f, "application/vnd.pyx.simple.v1+json"),
+            Self::PypiV1Json => write!(f, "application/vnd.pypi.simple.v1+json"),
+            Self::PypiV1Html => write!(f, "application/vnd.pypi.simple.v1+html"),
+            Self::TextHtml => write!(f, "text/html"),
+        }
     }
 }
 
