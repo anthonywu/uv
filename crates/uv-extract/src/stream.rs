@@ -532,25 +532,19 @@ pub async fn unzip<R: tokio::io::AsyncRead + Unpin>(
         }
     }
 
-    // Determine whether the reader is exhausted, but allow trailing null bytes, which some zip
-    // implementations incorrectly include.
+    // Determine whether the reader is exhausted.
     if !skip_validation {
-        let mut has_trailing_bytes = false;
-        let mut buf = [0u8; 256];
-        loop {
-            let n = reader.read(&mut buf).await.map_err(Error::Io)?;
-            if n == 0 {
-                if has_trailing_bytes {
-                    warn!("Ignoring trailing null bytes in ZIP archive");
-                }
-                break;
-            }
-            for &b in &buf[..n] {
-                if b == 0 {
-                    has_trailing_bytes = true;
-                } else {
+        let mut buffer = [0; 1];
+        if reader.read(&mut buffer).await.map_err(Error::Io)? > 0 {
+            // If the buffer contains a single null byte, ignore it.
+            if buffer[0] == 0 {
+                if reader.read(&mut buffer).await.map_err(Error::Io)? > 0 {
                     return Err(Error::TrailingContents);
                 }
+
+                warn!("Ignoring trailing null byte in ZIP archive");
+            } else {
+                return Err(Error::TrailingContents);
             }
         }
     }
@@ -684,6 +678,16 @@ pub async fn untar_zst<R: tokio::io::AsyncRead + Unpin>(
     untar_in(archive, target.as_ref())
         .await
         .map_err(Error::io_or_compression)
+}
+
+/// Unpack a `.tar.zst` archive from a file on disk into the target directory.
+pub fn untar_zst_file<R: std::io::Read>(reader: R, target: impl AsRef<Path>) -> Result<(), Error> {
+    let reader = std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, reader);
+    let decompressed = zstd::Decoder::new(reader).map_err(Error::Io)?;
+    let mut archive = tar::Archive::new(decompressed);
+    archive.set_preserve_mtime(false);
+    archive.unpack(target).map_err(Error::io_or_compression)?;
+    Ok(())
 }
 
 /// Unpack a `.tar.xz` archive into the target directory, without requiring `Seek`.

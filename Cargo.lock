@@ -5674,6 +5674,7 @@ dependencies = [
  "reqwest",
  "rustc-hash",
  "sha2",
+ "tar",
  "thiserror 2.0.16",
  "tokio",
  "tokio-util",
@@ -5684,6 +5685,7 @@ dependencies = [
  "uv-static",
  "xz2",
  "zip",
+ "zstd",
 ]
 
 [[package]]

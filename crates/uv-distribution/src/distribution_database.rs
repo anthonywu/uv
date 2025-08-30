@@ -194,9 +194,37 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         .to_file_path()
                         .map_err(|()| Error::NonFileUrl(url.clone()))?;
                     return self
-                        .load_wheel(&path, &wheel.filename, wheel_entry, dist, hashes)
+                        .load_wheel(
+                            &path,
+                            &wheel.filename,
+                            WheelExtension::Whl,
+                            wheel_entry,
+                            dist,
+                            hashes,
+                        )
                         .await;
                 }
+
+                // Add the `.zst` extension to the URL, if necessary.
+                let url = if wheel.file.zstd.is_some() {
+                    add_tar_zst_extension(url)
+                } else {
+                    url
+                };
+
+                // Determine the expected extension.
+                let extension = if wheel.file.zstd.is_some() {
+                    WheelExtension::WhlZst
+                } else {
+                    WheelExtension::Whl
+                };
+
+                // Determine the expected size.
+                let size = if let Some(zstd) = wheel.file.zstd.as_ref() {
+                    zstd.size
+                } else {
+                    wheel.file.size
+                };
 
                 // Download and unzip.
                 match self
@@ -204,7 +232,8 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         url.clone(),
                         dist.index(),
                         &wheel.filename,
-                        wheel.file.size,
+                        extension,
+                        size,
                         &wheel_entry,
                         dist,
                         hashes,
@@ -241,7 +270,8 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                                 url,
                                 dist.index(),
                                 &wheel.filename,
-                                wheel.file.size,
+                                extension,
+                                size,
                                 &wheel_entry,
                                 dist,
                                 hashes,
@@ -279,6 +309,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         wheel.url.raw().clone(),
                         None,
                         &wheel.filename,
+                        WheelExtension::Whl,
                         None,
                         &wheel_entry,
                         dist,
@@ -310,6 +341,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                                 wheel.url.raw().clone(),
                                 None,
                                 &wheel.filename,
+                                WheelExtension::Whl,
                                 None,
                                 &wheel_entry,
                                 dist,
@@ -343,6 +375,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 self.load_wheel(
                     &wheel.install_path,
                     &wheel.filename,
+                    WheelExtension::Whl,
                     cache_entry,
                     dist,
                     hashes,
@@ -547,6 +580,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         url: DisplaySafeUrl,
         index: Option<&IndexUrl>,
         filename: &WheelFilename,
+        extension: WheelExtension,
         size: Option<u64>,
         wheel_entry: &CacheEntry,
         dist: &BuiltDist,
@@ -588,15 +622,31 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 match progress {
                     Some((reporter, progress)) => {
                         let mut reader = ProgressReader::new(&mut hasher, progress, &**reporter);
-                        uv_extract::stream::unzip(&mut reader, temp_dir.path())
-                            .await
-                            .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        match extension {
+                            WheelExtension::Whl => {
+                                uv_extract::stream::unzip(&mut reader, temp_dir.path())
+                                    .await
+                                    .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                            }
+                            WheelExtension::WhlZst => {
+                                uv_extract::stream::untar_zst(&mut reader, temp_dir.path())
+                                    .await
+                                    .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                            }
+                        }
                     }
-                    None => {
-                        uv_extract::stream::unzip(&mut hasher, temp_dir.path())
-                            .await
-                            .map_err(|err| Error::Extract(filename.to_string(), err))?;
-                    }
+                    None => match extension {
+                        WheelExtension::Whl => {
+                            uv_extract::stream::unzip(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                        WheelExtension::WhlZst => {
+                            uv_extract::stream::untar_zst(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                    },
                 }
 
                 // If necessary, exhaust the reader to compute the hash.
@@ -701,6 +751,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         url: DisplaySafeUrl,
         index: Option<&IndexUrl>,
         filename: &WheelFilename,
+        extension: WheelExtension,
         size: Option<u64>,
         wheel_entry: &CacheEntry,
         dist: &BuiltDist,
@@ -772,7 +823,14 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         let target = temp_dir.path().to_owned();
                         move || -> Result<(), uv_extract::Error> {
                             // Unzip the wheel into a temporary directory.
-                            uv_extract::unzip(file, &target)?;
+                            match extension {
+                                WheelExtension::Whl => {
+                                    uv_extract::unzip(file, &target)?;
+                                }
+                                WheelExtension::WhlZst => {
+                                    uv_extract::stream::untar_zst_file(file, &target)?;
+                                }
+                            }
                             Ok(())
                         }
                     })
@@ -785,9 +843,19 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                     let algorithms = hashes.algorithms();
                     let mut hashers = algorithms.into_iter().map(Hasher::from).collect::<Vec<_>>();
                     let mut hasher = uv_extract::hash::HashReader::new(file, &mut hashers);
-                    uv_extract::stream::unzip(&mut hasher, temp_dir.path())
-                        .await
-                        .map_err(|err| Error::Extract(filename.to_string(), err))?;
+
+                    match extension {
+                        WheelExtension::Whl => {
+                            uv_extract::stream::unzip(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                        WheelExtension::WhlZst => {
+                            uv_extract::stream::untar_zst(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                    }
 
                     // If necessary, exhaust the reader to compute the hash.
                     hasher.finish().await.map_err(Error::HashExhaustion)?;
@@ -887,6 +955,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         &self,
         path: &Path,
         filename: &WheelFilename,
+        extension: WheelExtension,
         wheel_entry: CacheEntry,
         dist: &BuiltDist,
         hashes: HashPolicy<'_>,
@@ -965,9 +1034,18 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             let mut hasher = uv_extract::hash::HashReader::new(file, &mut hashers);
 
             // Unzip the wheel to a temporary directory.
-            uv_extract::stream::unzip(&mut hasher, temp_dir.path())
-                .await
-                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+            match extension {
+                WheelExtension::Whl => {
+                    uv_extract::stream::unzip(&mut hasher, temp_dir.path())
+                        .await
+                        .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                }
+                WheelExtension::WhlZst => {
+                    uv_extract::stream::untar_zst(&mut hasher, temp_dir.path())
+                        .await
+                        .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                }
+            }
 
             // Exhaust the reader to compute the hash.
             hasher.finish().await.map_err(Error::HashExhaustion)?;
@@ -1225,5 +1303,57 @@ impl LocalArchivePointer {
     /// Return the [`BuildInfo`] from the pointer.
     pub fn to_build_info(&self) -> Option<BuildInfo> {
         None
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WheelExtension {
+    Whl,
+    WhlZst,
+}
+
+/// Add `.tar.zst` to the end of the URL path, if it doesn't already exist.
+fn add_tar_zst_extension(mut url: DisplaySafeUrl) -> DisplaySafeUrl {
+    let mut path = url.path().to_string();
+
+    if !path.ends_with(".tar.zst") {
+        path.push_str(".tar.zst");
+    }
+
+    url.set_path(&path);
+    url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_tar_zst_extension() {
+        let url =
+            DisplaySafeUrl::parse("https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl")
+                .unwrap();
+        assert_eq!(
+            add_tar_zst_extension(url).as_str(),
+            "https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl.tar.zst"
+        );
+
+        let url = DisplaySafeUrl::parse(
+            "https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl.tar.zst",
+        )
+        .unwrap();
+        assert_eq!(
+            add_tar_zst_extension(url).as_str(),
+            "https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl.tar.zst"
+        );
+
+        let url = DisplaySafeUrl::parse(
+            "https://files.pythonhosted.org/flask-3.1.0%2Bcu124-py3-none-any.whl",
+        )
+        .unwrap();
+        assert_eq!(
+            add_tar_zst_extension(url).as_str(),
+            "https://files.pythonhosted.org/flask-3.1.0%2Bcu124-py3-none-any.whl.tar.zst"
+        );
     }
 }
