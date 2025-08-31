@@ -5097,6 +5097,7 @@ dependencies = [
  "url",
  "uv-keyring",
  "uv-once-map",
+ "uv-preview",
  "uv-redacted",
  "uv-small-str",
  "uv-state",
@@ -5414,9 +5415,7 @@ dependencies = [
  "uv-pep440",
  "uv-pep508",
  "uv-platform-tags",
- "uv-preview",
  "uv-static",
- "uv-warnings",
 ]
 
 [[package]]
